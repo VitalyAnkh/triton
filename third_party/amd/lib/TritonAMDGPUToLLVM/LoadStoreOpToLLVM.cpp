@@ -34,7 +34,7 @@ Value redundantDataMask(Type valueTy, ConversionPatternRewriter &rewriter,
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   auto tensorTy = dyn_cast<RankedTensorType>(valueTy);
   Value mask = b.int_val(1, 1);
-  auto tid = b.tid_val();
+  auto tid = getThreadId(rewriter, loc);
   auto clusterCTAId = targetInfo.getClusterCTAId(rewriter, loc);
   if (tensorTy) {
     auto layout = tensorTy.getEncoding();
@@ -177,10 +177,6 @@ struct LoadStoreConversionBase {
     return axisAnalysisPass.getMaskAlignment(mask);
   }
 
-  unsigned getPtrAlignment(Value ptr) const {
-    return axisAnalysisPass.getPtrAlignment(ptr);
-  }
-
   std::optional<const std::string>
   getAMDGPUMemScopeStr(MemSyncScope scope) const {
     // See: https://llvm.org/docs/AMDGPUUsage.html#memory-scopes
@@ -263,7 +259,6 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
         std::max(8u, valueElemTy.getIntOrFloatBitWidth());
     const size_t valueElemNBytes = valueElemNBits / 8;
     const int numVecs = numElems / vec;
-    int64_t ptrAlignmentBytes = getPtrAlignment(ptr) * valueElemNBytes;
 
     auto cacheMod = op.getCache();
     SmallVector<Value> loadedVals;
@@ -287,8 +282,8 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
             rewriter, this->getTypeConverter(), loc, cast<VectorType>(vecTy),
             otherElems, vecStart);
 
-      Value loadVal = llLoad(rewriter, loc, ptr, vecTy, pred, falseVal,
-                             ptrAlignmentBytes, cacheMod);
+      Value loadVal =
+          llLoad(rewriter, loc, ptr, vecTy, pred, falseVal, cacheMod);
       for (size_t ii = 0; ii < vec; ++ii) {
         Value vecIdx = createIndexAttrConstant(
             rewriter, loc, getTypeConverter()->getIndexType(), ii);
@@ -511,7 +506,7 @@ struct AsyncCopyGlobalToLocalOpConversion
 
     Value cacheModifiers =
         b.i32_val(mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
-            op.getCache(), false, targetInfo));
+            op.getCache(), /*isLoad=*/true, targetInfo));
 
     Value llMask = adaptor.getMask();
     SmallVector<Value> maskElems;
@@ -556,7 +551,7 @@ struct AsyncCopyGlobalToLocalOpConversion
         Value storeVal = packElementRangeIntoVector(
             rewriter, this->getTypeConverter(), loc, vecTy, otherElems, srcIdx);
         llStore(rewriter, loc, shmemAddrs[i], storeVal,
-                b.icmp_ne(maskElems[srcIdx], b.true_val()), 0, op.getCache());
+                b.icmp_ne(maskElems[srcIdx], b.true_val()), op.getCache());
       }
     }
 
@@ -613,7 +608,6 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
     const size_t valueElemNBits =
         std::max<int>(8, valueElemTy.getIntOrFloatBitWidth());
     const size_t valueElemNBytes = valueElemNBits / 8;
-    int64_t ptrAlignmentBytes = getPtrAlignment(ptr) * valueElemNBytes;
 
     auto cacheMod = op.getCache();
     const int numVecs = elemsPerThread / vec;
@@ -637,7 +631,7 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
       Value storeVal = packElementRangeIntoVector(
           rewriter, this->getTypeConverter(), loc, cast<VectorType>(vecTy),
           valueElems, vecStart);
-      llStore(rewriter, loc, ptr, storeVal, pred, ptrAlignmentBytes, cacheMod);
+      llStore(rewriter, loc, ptr, storeVal, pred, cacheMod);
     } // end vec
     rewriter.eraseOp(op);
     return success();
@@ -691,6 +685,7 @@ struct BufferAtomicRMWOpConversion
     Value llOffset = adaptor.getOffsets();
     Value llMask = adaptor.getMask();
     Value llData = adaptor.getValue();
+    Value llStride = adaptor.getStride();
 
     // Determine the vectorization size
     Type valueTy = data.getType();
@@ -751,7 +746,7 @@ struct BufferAtomicRMWOpConversion
       emitReleaseFence = true;
     }
 
-    Value rsrcDesc = bufferEmitter.createResourceDescriptor(llPtr);
+    Value rsrcDesc = bufferEmitter.createResourceDescriptor(llPtr, llStride);
     Value rDataMask = redundantDataMask(valueTy, rewriter, loc, targetInfo);
     SmallVector<Value> loadedVals;
 
@@ -1061,7 +1056,7 @@ struct AtomicCASOpConversion
 
         // Fill entry block with global memory barrier and conditional branch.
         rewriter.setInsertionPointToEnd(curBlock);
-        auto tid = b.tid_val();
+        auto tid = getThreadId(rewriter, loc);
         Value pred = b.icmp_eq(tid, b.i32_val(i));
         rewriter.create<LLVM::CondBrOp>(loc, pred, atomicBlock, endBlock);
 
@@ -1328,7 +1323,7 @@ struct AtomicRMWOpConversion
       numElems = tensorTy.getNumElements();
     }
     Value mask = b.int_val(1, 1);
-    auto tid = b.tid_val();
+    auto tid = getThreadId(rewriter, loc);
     mask = b.and_(mask, b.icmp_slt(b.mul(tid, b.i32_val(elemsPerThread)),
                                    b.i32_val(numElems)));
     if (useDppForPackedF16)
@@ -1682,7 +1677,7 @@ struct AsyncWaitOpConversion : public ConvertOpToLLVMPattern<AsyncWaitOp> {
     unsigned otherCnts = ~0xC00F; // C00F has bits 15:14 and 3:0 set
     unsigned waitValue = lowBits | highBits | otherCnts;
 
-    rewriter.create<ROCDL::WaitcntOp>(loc, waitValue);
+    rewriter.create<ROCDL::SWaitcntOp>(loc, waitValue);
 
     // Drop the result AsyncToken
     rewriter.replaceOp(op, b.i32_val(0));
@@ -1714,7 +1709,6 @@ namespace mlir::triton::AMD {
 void populateLoadStoreOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                        const TargetInfo &targetInfo,
                                        RewritePatternSet &patterns,
-                                       int numWarps,
                                        ModuleAxisInfoAnalysis &axisInfoAnalysis,
                                        PatternBenefit benefit) {
   patterns

@@ -22,37 +22,12 @@
 #include "triton/Tools/Sys/GetEnv.hpp"
 
 namespace mlir {
-namespace {
 
 using namespace triton;
 using namespace triton::gpu;
 
-int getParentAxis(Attribute layout, int axis) {
-  if (auto sliceEncoding = dyn_cast<SliceEncodingAttr>(layout)) {
-    axis = axis < sliceEncoding.getDim() ? axis : axis + 1;
-    return getParentAxis(sliceEncoding.getParent(), axis);
-  }
-  return axis;
-}
-
-SmallVector<unsigned> getParentOrder(Attribute layout) {
-  if (auto sliceEncoding = mlir::dyn_cast<SliceEncodingAttr>(layout)) {
-    return getParentOrder(sliceEncoding.getParent());
-  }
-  return getThreadOrder(layout);
-}
-
-} // namespace
-
-// TODO(jlebar): Move this class into namespace triton.
-bool ReduceOpHelper::isReductionOnLayoutFastAxis() {
-  return getParentAxis(getSrcLayout(), axis) ==
-         getParentOrder(getSrcLayout())[0];
-}
-
 SmallVector<unsigned> ReduceOpHelper::getOrderWithAxisAtBeginning() {
-  auto srcLayout = getSrcLayout();
-  auto order = getOrder(srcLayout);
+  auto order = toLinearEncoding(srcEncoding, srcShape).getOrder();
   auto it = std::find(order.begin(), order.end(), axis);
   // delete the axis from order
   order.erase(it);
@@ -64,10 +39,8 @@ SmallVector<unsigned> ReduceOpHelper::getOrderWithAxisAtBeginning() {
 // Thread offset is the thread index offset of two adjacent threads on the
 // reduction axis within the warp.
 unsigned ReduceOpHelper::getThreadOffsetOnReductionAxis() {
-  auto srcLayout = getSrcLayout();
-  auto *ctx = srcLayout.getContext();
-  auto linearLayout = toLinearLayout(getSrcShape(), srcLayout);
-  auto axis = getAxis();
+  auto *ctx = srcEncoding.getContext();
+  auto linearLayout = toLinearLayout(srcShape, srcEncoding);
   auto kLane = mlir::StringAttr::get(ctx, "lane");
   const auto &bases = linearLayout.getBases();
   const auto &lanes = bases.find(kLane)->second;
@@ -125,56 +98,25 @@ bool shouldUseDistSmem(Attribute srcLayout, Attribute dstLayout) {
   return true;
 }
 
-unsigned ReduceOpHelper::getInterWarpSize() {
-  auto srcReduceDimSize = static_cast<unsigned>(srcShape[axis]);
-  unsigned sizeIntraWarps = getIntraWarpSize();
-  return std::min(srcReduceDimSize / sizeIntraWarps,
-                  getWarpsPerCTA(getSrcLayout())[axis]);
-}
-
-unsigned ReduceOpHelper::getIntraWarpSize() {
-  auto srcReduceDimSize = static_cast<unsigned>(srcShape[axis]);
-  return std::min(srcReduceDimSize, getThreadsPerWarp(getSrcLayout())[axis]);
-}
-
 unsigned ReduceOpHelper::getInterWarpSizeWithUniqueData() {
-  auto srcReduceDimSize = static_cast<unsigned>(srcShape[axis]);
-  unsigned sizeIntraWarps = getIntraWarpSizeWithUniqueData();
-  return std::min(
-      srcReduceDimSize / sizeIntraWarps,
-      getWarpsPerCTAWithUniqueData(getSrcLayout(), getSrcShape())[axis]);
+  return getWarpsPerCTAWithUniqueData(srcEncoding, srcShape)[axis];
 }
 
 unsigned ReduceOpHelper::getIntraWarpSizeWithUniqueData() {
-  auto srcReduceDimSize = static_cast<unsigned>(srcShape[axis]);
-  unsigned elementPerThreads =
-      getUniqueContigPerThread(getSrcLayout(), getSrcShape())[axis];
-  return std::min(
-      srcReduceDimSize / elementPerThreads,
-      getThreadsPerWarpWithUniqueData(getSrcLayout(), getSrcShape())[axis]);
-}
-
-unsigned ReduceOpHelper::getThreadsReductionAxis() {
-  auto axis = getAxis();
-  auto *ctx = getSrcLayout().getContext();
-  auto ll = LinearEncodingAttr::get(
-      ctx, toLinearLayout(getSrcShape(), getSrcLayout()));
-  return ll.getThreadsPerWarp()[axis] * ll.getWarpsPerCTA()[axis];
+  return getThreadsPerWarpWithUniqueData(srcEncoding, srcShape)[axis];
 }
 
 bool ReduceOpHelper::isWarpSynchronous() {
-  auto srcLayout = getSrcLayout();
-  auto srcShape = getSrcShape();
-  return getWarpsPerCTAWithUniqueData(srcLayout, srcShape)[axis] == 1;
+  return getWarpsPerCTAWithUniqueData(srcEncoding, srcShape)[axis] == 1;
 }
 
 SmallVector<unsigned> ReduceOpHelper::getScratchRepShape() {
   SmallVector<unsigned> smemShape;
-  // that case doesn't need inter-warp communication
+  // This case doesn't need inter-warp communication
   if (isWarpSynchronous())
     return {0, 0};
 
-  smemShape = convertType<unsigned>(getSrcShape());
+  smemShape = convertType<unsigned>(srcShape);
   smemShape[axis] = getInterWarpSizeWithUniqueData();
 
   return smemShape;
@@ -192,96 +134,66 @@ unsigned ReduceOpHelper::getScratchSizeInBytes() {
 }
 
 bool ReduceOpHelper::isReduceWithinCTA() {
-  auto axis = getAxis();
-  auto srcLayout = getSrcLayout();
-  auto CTASplitNum = getCTASplitNum(srcLayout);
-  assert(axis < CTASplitNum.size());
-  return CTASplitNum[axis] == 1;
-}
-
-bool ReduceOpHelper::isSupportedLayout() {
+  // TODO: Support reduce across CTAS
   // Layout optimization passes such as PlanCTAPass and
   // RemoveLayoutConversionPass should avoid cross-CTA reduction
-  if (!isReduceWithinCTA()) {
-    return false;
-  }
-
-  auto srcLayout = getSrcLayout();
-  if (isa<BlockedEncodingAttr, LinearEncodingAttr, SliceEncodingAttr>(
-          srcLayout)) {
-    return true;
-  }
-
-  if (auto mmaLayout = dyn_cast<MmaEncodingTrait>(srcLayout)) {
-    return mmaLayout.supportReduction();
-  }
-  return false;
+  return getCTASplitNum(srcEncoding)[axis] == 1;
 }
 
 unsigned ScanLoweringHelper::getAxisNumElementsPerThread() {
-  return getEncoding().getSizePerThread()[getAxis()];
+  return getEncoding().getContigPerThread()[getAxis()];
 }
 
 unsigned ScanLoweringHelper::getNonAxisNumElementsPerThread() {
-  SmallVector<unsigned> sizePerThreads = getContigPerThread(getEncoding());
-  sizePerThreads[getAxis()] = 1;
-  return product<unsigned>(sizePerThreads);
+  auto contigPerThread = getEncoding().getContigPerThread();
+  contigPerThread[getAxis()] = 1;
+  return product<unsigned>(contigPerThread);
 }
 
 Region &ScanLoweringHelper::getCombineOp() { return scanOp.getCombineOp(); }
 
-unsigned ScanLoweringHelper::getAxisNumThreadsPerWarp() {
-  return getThreadsPerWarp(getEncoding())[getAxis()];
-}
-
 unsigned ScanLoweringHelper::getAxisNumThreadsPerWarpWithUniqueData() {
-  return getThreadsPerWarpWithUniqueData(getEncoding(), getShape())[getAxis()];
+  return getEncoding().getThreadsPerWarp()[getAxis()];
 }
 
 unsigned ScanLoweringHelper::getNonAxisNumThreadsPerWarp() {
-  auto threadsPerWarp = getThreadsPerWarp(getEncoding());
-  threadsPerWarp[getAxis()] = 1;
-  return product<unsigned>(threadsPerWarp);
+  auto nThreads = product(getEncoding().getThreadsPerWarp());
+  return nThreads / getAxisNumThreadsPerWarpWithUniqueData();
 }
 
 // Return the flat numbers of threads computing independent scan results.
 unsigned ScanLoweringHelper::getNonAxisNumThreadsPerCTA() {
-  unsigned numParallelThreadsPerWarp = getNonAxisNumThreadsPerWarp();
-  auto warpsPerCTA = getWarpsPerCTA(getEncoding());
-  warpsPerCTA[getAxis()] = 1;
-  unsigned numParallelWarpsPerCTA = product<unsigned>(warpsPerCTA);
-  return numParallelThreadsPerWarp * numParallelWarpsPerCTA;
-}
-
-unsigned ScanLoweringHelper::getAxisNumWarps() {
-  return getWarpsPerCTA(getEncoding())[getAxis()];
+  auto nWarps = product(getEncoding().getWarpsPerCTA());
+  return (nWarps / getAxisNumWarpsWithUniqueData()) *
+         getNonAxisNumThreadsPerWarp();
 }
 
 unsigned ScanLoweringHelper::getAxisNumWarpsWithUniqueData() {
-  return getWarpsPerCTAWithUniqueData(getEncoding(), getShape())[getAxis()];
+  return getEncoding().getWarpsPerCTA()[getAxis()];
 }
 
 unsigned ScanLoweringHelper::getAxisNumBlocks() {
-  auto sizePerThreads = getSizePerThread(getEncoding());
+  auto contigPerThread = getEncoding().getContigPerThread();
   auto threadsPerWarp = getThreadsPerWarp(getEncoding());
   auto warpsPerCTA = getWarpsPerCTA(getEncoding());
   unsigned axis = getAxis();
   return ceil<unsigned>(
       getShape()[axis],
-      (sizePerThreads[axis] * threadsPerWarp[axis] * warpsPerCTA[axis]));
+      (contigPerThread[axis] * threadsPerWarp[axis] * warpsPerCTA[axis]));
 }
 
 unsigned ScanLoweringHelper::getNonAxisNumBlocks() {
-  auto sizePerThreads = getSizePerThread(getEncoding());
+  auto contigPerThread = getEncoding().getContigPerThread();
   auto threadsPerWarp = getThreadsPerWarp(getEncoding());
   auto warpsPerCTA = getWarpsPerCTA(getEncoding());
+  auto rank = contigPerThread.size();
   unsigned axis = getAxis();
   unsigned numBlocks = 1;
-  for (unsigned i = 0; i < sizePerThreads.size(); i++) {
+  for (unsigned i = 0; i < rank; i++) {
     if (i == axis)
       continue;
     numBlocks *=
-        ceil<unsigned>(getShape()[i], (sizePerThreads[i] * threadsPerWarp[i] *
+        ceil<unsigned>(getShape()[i], (contigPerThread[i] * threadsPerWarp[i] *
                                        warpsPerCTA[i]));
   }
   return numBlocks;
@@ -290,14 +202,13 @@ unsigned ScanLoweringHelper::getNonAxisNumBlocks() {
 bool ScanLoweringHelper::isSupported() {
   // TODO: Support the following cases:
   // 1. Scan on non-blocking encodings
-  if (!isa<BlockedEncodingAttr>(srcEncoding))
+  if (!isa<BlockedEncodingAttr>(legacyEncoding))
     return false;
   return true;
 }
 
 unsigned ScanLoweringHelper::getScratchSizeInElems() {
-  auto mod = scanOp->getParentOfType<ModuleOp>();
-  unsigned numWarps = TritonGPUDialect::getNumWarps(mod);
+  unsigned numWarps = product(getEncoding().getWarpsPerCTA());
   unsigned numNonAxisElementsPerWarp =
       getNonAxisNumThreadsPerWarp() * getNonAxisNumElementsPerThread();
   unsigned numElements = numWarps * numNonAxisElementsPerWarp *
@@ -579,42 +490,43 @@ getReshapeDecomposition(ArrayRef<int64_t> srcShape,
   return ret;
 }
 
-BlockedEncodingAttr ScanLoweringHelper::getEncoding() {
-  return cast<BlockedEncodingAttr>(srcEncoding);
-}
-
 unsigned ScanLoweringHelper::getAxisElementStride() {
-  auto order = getOrder(getEncoding());
+  auto order = getOrder();
   unsigned stride = 1;
   for (unsigned dim : order) {
     if (dim == getAxis())
       return stride;
-    stride *= getContigPerThread(getEncoding())[dim];
+    stride *= getEncoding().getContigPerThread()[dim];
   }
   llvm_unreachable("Axis not found in order");
 }
 
 unsigned ScanLoweringHelper::getAxisThreadStride() {
-  auto order = getOrder(getEncoding());
+  auto encoding = getEncoding();
+  auto kThread = StringAttr::get(encoding.getContext(), "lane");
+  // OOOGHHH This is nasty. We should implement this lowering via LLs natively
+  // to avoid this
+  auto threadsPerWarp = encoding.basesPerDim(kThread, /*skipBroadcast=*/false);
+  auto order = getOrder();
   unsigned stride = 1;
   for (unsigned dim : order) {
     if (dim == getAxis())
       return stride;
-    stride *= getEncoding().getThreadsPerWarp()[dim];
+    stride *= threadsPerWarp[dim];
   }
   llvm_unreachable("Axis not found in order");
 }
 
 unsigned ScanLoweringHelper::getAxisBlockStride() {
-  auto order = getOrder(getEncoding());
+  auto order = getOrder();
   unsigned stride = 1;
-  auto sizePerThreads = getSizePerThread(getEncoding());
+  auto contigPerThread = getEncoding().getContigPerThread();
   auto threadsPerWarp = getThreadsPerWarp(getEncoding());
   auto warpsPerCTA = getWarpsPerCTA(getEncoding());
   for (unsigned dim : order) {
     if (dim == getAxis())
       return stride;
-    stride *= ceil<unsigned int>(getShape()[dim], sizePerThreads[dim] *
+    stride *= ceil<unsigned int>(getShape()[dim], contigPerThread[dim] *
                                                       threadsPerWarp[dim] *
                                                       warpsPerCTA[dim]);
   }
@@ -720,14 +632,17 @@ bool supportMMA(triton::DotOp op, int version) {
     auto retType = op.getType();
     auto retShapePerCTA = getShapePerCTA(retType);
     auto rank = retShapePerCTA.size();
-    auto mod = op->getParentOfType<ModuleOp>();
-    int numWarps = TritonGPUDialect::getNumWarps(mod);
+    int numWarps = lookupNumWarps(op);
     if (aElemTy.isInteger() || bElemTy.isInteger() ||
         retType.getElementType().isInteger())
       return false;
     if (op.getType().getRank() != 2)
       return false;
-    if (!(numWarps % 4 == 0 && retShapePerCTA[rank - 2] % 64 == 0 &&
+    if (numWarps != 4 && numWarps != 8) {
+      // Currently only support numWarps 4 or 8 for TMEM load and store.
+      return false;
+    }
+    if (!(retShapePerCTA[rank - 2] % 64 == 0 &&
           retShapePerCTA[rank - 1] % 8 == 0))
       return false;
     return true;
@@ -743,8 +658,7 @@ bool supportMMA(triton::DotOp op, int version) {
       return false;
     auto retShapePerCTA = getShapePerCTA(retType);
     auto rank = retShapePerCTA.size();
-    auto mod = op->getParentOfType<ModuleOp>();
-    int numWarps = TritonGPUDialect::getNumWarps(mod);
+    int numWarps = lookupNumWarps(op);
     // TODO(Keren): for now, fallback to MMAv2 if handling batch matmul.
     if (rank == 3)
       return false;
