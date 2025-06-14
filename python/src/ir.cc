@@ -157,7 +157,7 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
   py::list result;
   triton::FuncOp kernelFunc;
   mod.walk([&](triton::FuncOp func) {
-    if (LLVM::isKernel(func)) {
+    if (triton::isKernel(func)) {
       kernelFunc = func;
       return WalkResult::interrupt();
     }
@@ -585,7 +585,7 @@ void init_triton_ir(py::module &&m) {
            [](ModuleOp &self) -> std::string {
              for (auto &op : self.getOps()) {
                if (auto func = dyn_cast<FuncOp>(op)) {
-                 if (LLVM::isKernel(func))
+                 if (triton::isKernel(func))
                    return func.getName().str();
                }
              }
@@ -1425,12 +1425,7 @@ void init_triton_ir(py::module &&m) {
            })
       .def("create_expand_dims",
            [](TritonOpBuilder &self, Value &arg, int axis) -> Value {
-             auto argType = dyn_cast<RankedTensorType>(arg.getType());
-             auto argEltType = argType.getElementType();
-             std::vector<int64_t> retShape = argType.getShape();
-             retShape.insert(retShape.begin() + axis, 1);
-             return self.create<ExpandDimsOp>(
-                 RankedTensorType::get(retShape, argEltType), arg, axis);
+             return self.create<ExpandDimsOp>(arg, axis);
            })
       .def("create_cat",
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
